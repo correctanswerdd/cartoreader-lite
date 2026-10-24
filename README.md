@@ -9,6 +9,25 @@ This repository is an inofficial reader to easily process exported [CARTO3 data]
 It does not provide the more extensive capabilities to analyze the signals, such as [OpenEP](https://openep.io/), but is rather meant as a simple reader to import CARTO data. 
 The loaded time data is imported in [pandas](https://pandas.pydata.org) and the meshes in [VTK](https://vtk.org/) provided through [PyVista](https://www.pyvista.org), allowing for easy access, export and interoperatibility with existing software.
 
+# About this fork (branch `carto-extras`, version `1.0.1+ou.1`)
+
+This branch is frozen at upstream commit `2e61b91` for reproducibility; later upstream changes are not merged.
+It adds the following options, all of which default to the upstream behavior:
+
+* `map_names`: only import the maps with the given names (list, single name, or a function `name -> bool`)
+* `point_cache_dir`: cache the raw point data of each map and reuse it on the next import
+* `executor`: `"process"` (default), `"thread"` or `None` (serial) import
+* `parse_ablation`: set to `False` to skip the VisiTag ablation data
+* ECG_Export_4.1 files are read alongside 4.0; the mapping channels of each point are available as `ecg_interest_channels`
+* The points table additionally contains `ecg_interest_channels`, `surface_ecg`, `egm` and `proj_tri_id`
+
+```python
+study = CartoStudy(study_dir, study_name, map_names=["5-LA-BIPOLAR"], point_cache_dir="cache")
+```
+
+Install with `pip install git+https://github.com/correctanswerdd/cartoreader-lite@carto-extras`.
+All credit for the original library goes to Thomas Grandits; please cite the original work (see [Citation](#citation)).
+
 # Installation
 
 To install `cartoreader_lite`, you can simply install the package from PyPI:

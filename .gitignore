@@ -8,3 +8,11 @@ cartoreader_lite/output/*
 coverage_html*
 dist*
 .coverage
+
+# Never commit study data or caches
+*.pickle
+*.pkl
+*.pkl.gz
+data/
+Export_*/
+openep-testingdata*

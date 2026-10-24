@@ -49,6 +49,28 @@ def read_contact_force(fname : str) -> pd.DataFrame:
 
     return metadata, data
 
+ecg_channels_re = re.compile(r"Unipolar Mapping Channel=(\S+)\s+Bipolar Mapping Channel=(\S+)\s+Reference Channel=(\S+)")
+
+def read_ecg_channels(ecg_elem : Element, ecg_metadata : List[str]) -> Tuple[str, str, str]:
+    """Reads the unipolar, bipolar and reference mapping channels of a point.
+    ECG_Export_4.1 stores them as attributes of the ECG XML element, ECG_Export_4.0 in the ECG file header.
+
+    Returns
+    -------
+    Tuple[str, str, str]
+        (unipolar, bipolar, reference) channel names, or None if not found
+    """
+    keys = ("UnipolarMappingChannel", "BipolarMappingChannel", "ReferenceChannel")
+    if all(k in ecg_elem.attrib for k in keys):
+        return tuple(ecg_elem.attrib[k] for k in keys)
+
+    for line in ecg_metadata:
+        match = ecg_channels_re.search(line)
+        if match is not None:
+            return match.groups()
+
+    return None
+
 def read_point_data(map_name : str, point_id : int, path_prefix : str = None) -> Tuple[Dict, Dict]:
     """Reads all the available point data for given map and point ID, along with its metadata.
 
@@ -83,16 +105,20 @@ def read_point_data(map_name : str, point_id : int, path_prefix : str = None) ->
         if elem.tag == "Positions":
             data["connector_data"] = read_connectors(elem, path_prefix)
         elif elem.tag == "ECG":
-            #ecg_metadata = 
             ecg_fname = os.path.join(path_prefix, elem.attrib["FileName"])
             with open(ecg_fname, "r") as ecg_f:
-                ecg_metadata = [ecg_f.readline().strip() for i in range(3)]
+                #The first line holds the export version (e.g. ECG_Export_4.0), followed by key=value metadata lines.
+                #ECG_Export_4.0 has 2 such lines (gain, mapping channels), ECG_Export_4.1 only 1 (gain).
+                ecg_metadata = [ecg_f.readline().strip()]
                 ecg_header = ecg_f.readline()
+                while "=" in ecg_header:
+                    ecg_metadata.append(ecg_header.strip())
+                    ecg_header = ecg_f.readline()
                 ecg_header = [elem for elem in re.split(multi_whitespace_re, ecg_header) if len(elem) > 0] #Two or more whitespaces as delimiters
                 #ecg_f.seek(0)
                 ecg_data = pd.read_csv(ecg_f, #skiprows=4, #Not necessary if we don't seek to the beginning
                                         header=None, sep="\s+", names=ecg_header, dtype=np.int16)
-            data["ecg"] = (ecg_metadata, ecg_data) 
+            data["ecg"] = (ecg_metadata, ecg_data, read_ecg_channels(elem, ecg_metadata))
         elif elem.tag == "ContactForce":
             data["contact_force_data"] = read_contact_force(os.path.join(path_prefix, elem.attrib["FileName"]))
         else:

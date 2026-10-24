@@ -2,7 +2,7 @@ from __future__ import annotations #recursive type hinting
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor 
 import logging as log
 import pickle
-from typing import Dict, List, Tuple, IO, Union
+from typing import Callable, Dict, Iterable, List, Tuple, IO, Union
 
 from cartoreader_lite.low_level.utils import convert_fname_to_handle, simplify_dataframe_dtypes, unify_time_data, xyz_to_pos_vec
 from ..low_level.study import CartoLLStudy, CartoLLMap, CartoAuxMesh
@@ -126,7 +126,8 @@ class CartoPointDetailData():
     bip_volt : float #: Bipolar voltage magnitdue    
     connectors : List[str] #: List of the recorded connector names
     ecg_gain : float #: Gain of the recorded :term:`ECGs<ECG>`
-    ecg_metadata : object #: Additional provided metadata regarding the :term:`ECGs<ECG>` or :term:`EGMs<EGM>`
+    ecg_metadata : object #: Additional provided metadata regarding the :term:`ECGs<ECG>` or :term:`EGMs<EGM>`. None for ECG_Export_4.1 files, which store it in the point XML instead.
+    ecg_interest_channels : Tuple[str, str, str] #: Unipolar, bipolar and reference mapping channel of the point, or None if not exported
     surface_ecg : pd.DataFrame #: Recorded surface :term:`ECG`. Has type np.int16 and needs to be multiplied by :attr:`~CartoPointDetailData.ecg_gain` to get the ECG in Volts
     egm : pd.DataFrame #: Recorded electrograms at the point through the connectors. Naming and columns differ for each setup
 
@@ -163,7 +164,8 @@ class CartoPointDetailData():
         #ECG
         ecg_gain_str = raw_data[1]["ecg"][0][1] #Pass ECG metadata
         self.ecg_gain = float(ecg_gain_re.match(ecg_gain_str).group(1))
-        self.ecg_metadata = raw_data[1]["ecg"][0][2]
+        self.ecg_metadata = raw_data[1]["ecg"][0][2] if len(raw_data[1]["ecg"][0]) > 2 else None
+        self.ecg_interest_channels = raw_data[1]["ecg"][2] if len(raw_data[1]["ecg"]) > 2 else None
         #self.ecg_export_version_number = data[1]["ecg"][0][0]""
         ecg_data = raw_data[1]["ecg"][1]
         assert np.iinfo(np.int16).min <= ecg_data.min().min() and np.iinfo(np.int16).max >= ecg_data.max().max(), "ECG can not be simplified to np.in16"
@@ -184,8 +186,8 @@ class CartoPointDetailData():
     @property
     def main_point_pd_row(self):
         pd_attrs = ["id", "pos", "cath_orientation", "cath_id", "woi", "start_time", "ref_annotation", 
-                    "map_annotation", "uni_volt", "bip_volt", "connectors",
-                    ] #"surface_ecg", "egm"]
+                    "map_annotation", "uni_volt", "bip_volt", "connectors", "ecg_interest_channels",
+                    "surface_ecg", "egm"]
 
         #This represents a single row of the returning pandas DataFrame
         return {**{k: getattr(self, k) for k in pd_attrs}, **{"detail": self}}
@@ -244,13 +246,15 @@ class CartoMap():
         #Project points onto the geometry
         if proj_points:
             if len(self.points) > 0:
-                proj_points, proj_dist = project_points(self.mesh, np.stack(self.points["pos"].to_numpy()))[:2]
+                proj_points, proj_dist, proj_tri_id = project_points(self.mesh, np.stack(self.points["pos"].to_numpy()))
                 self.points["proj_pos"] = proj_points.tolist()
                 self.points["proj_dist"] = proj_dist
+                self.points["proj_tri_id"] = proj_tri_id #Index of the closest triangle
 
             elif type(self.points) == pd.DataFrame: #Add empty columns just to be consistent
                 self.points["proj_pos"] = []
                 self.points["proj_dist"] = []
+                self.points["proj_tri_id"] = []
 
     @property
     def nr_points(self):
@@ -284,6 +288,16 @@ class CartoStudy():
             Optional keyword arguments to be passed to :class:`AblationSites`
         carto_map_kwargs : Dict
             Optional keyword arguments to be passed to :class:`CartoMap`
+        map_names : Union[Iterable[str], Callable[[str], bool]], optional
+            Only maps whose name is contained in this list (or for which this function returns True) will be imported.
+            By default None (all maps)
+        point_cache_dir : str, optional
+            Directory used to cache the raw point data of each map, see :class:`cartoreader_lite.low_level.study.CartoLLMap`.
+            By default None (no caching)
+        executor : str, optional
+            Executor used to parallelize the import: "process", "thread" or None (serial). By default "process"
+        parse_ablation : bool, optional
+            If false, the VisiTag ablation data will not be processed and :attr:`ablation_data` will be None. By default True
     """
 
     name : str #: The name of the study
@@ -293,7 +307,7 @@ class CartoStudy():
     aux_mesh_reg_mat : np.ndarray #: 4x4 affine registration matrix to map the auxiliary meshes.
 
     
-    def _simplify(self, ll_study : CartoLLStudy, ablation_sites_kwargs : Dict, carto_map_kwargs : Dict):
+    def _simplify(self, ll_study : CartoLLStudy, ablation_sites_kwargs : Dict, carto_map_kwargs : Dict, parse_ablation=True):
         """Function to simplify the data given by the lower level ll_study.
 
         Parameters
@@ -305,13 +319,15 @@ class CartoStudy():
         carto_map_kwargs : Dict
             Optional keyword arguments to be passed to :class:`CartoMap`
         """
-        self.ablation_data = AblationSites(ll_study.visitag_data, **ablation_sites_kwargs)
+        self.ablation_data = AblationSites(ll_study.visitag_data, **ablation_sites_kwargs) if parse_ablation else None
         self.maps = [CartoMap(m, **carto_map_kwargs) for m in ll_study.maps]
         self.name = ll_study.name
         self.aux_meshes = ll_study.aux_meshes
         self.aux_mesh_reg_mat = ll_study.aux_mesh_reg_mat
 
-    def __init__(self, arg1, arg2 = None, ablation_sites_kwargs=None, carto_map_kwargs=None) -> None:
+    def __init__(self, arg1, arg2 = None, ablation_sites_kwargs=None, carto_map_kwargs=None,
+                 map_names : Union[Iterable[str], Callable[[str], bool]] = None, point_cache_dir : str = None,
+                 executor : str = "process", parse_ablation=True) -> None:
 
         if ablation_sites_kwargs is None:
             ablation_sites_kwargs = {}
@@ -325,11 +341,11 @@ class CartoStudy():
             self.__dict__.update(loaded_study.__dict__)
         elif issubclass(type(arg1), CartoLLStudy) and arg2 is None:
             ll_study = arg1
-            self._simplify(ll_study, ablation_sites_kwargs, carto_map_kwargs)
+            self._simplify(ll_study, ablation_sites_kwargs, carto_map_kwargs, parse_ablation)
 
         else:
-            ll_study = CartoLLStudy(arg1, arg2)
-            self._simplify(ll_study, ablation_sites_kwargs, carto_map_kwargs)
+            ll_study = CartoLLStudy(arg1, arg2, map_names=map_names, point_cache_dir=point_cache_dir, executor=executor)
+            self._simplify(ll_study, ablation_sites_kwargs, carto_map_kwargs, parse_ablation)
 
     @property
     def nr_maps(self):

@@ -1,4 +1,4 @@
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, Future
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor, Future
 import xml.etree.ElementTree as ET 
 from xml.etree.ElementTree import Element
 import os
@@ -12,9 +12,46 @@ from itertools import repeat
 import tempfile
 import zipfile
 import pyvista as pv
-from typing import Dict
+from typing import Callable, Dict, Iterable, Union
+import pickle
 
 _parallelize_pool = ProcessPoolExecutor
+
+class _SerialExecutor(Executor):
+    """Executor running every task immediately in the calling thread"""
+
+    def submit(self, fn, *args, **kwargs) -> Future:
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as ex:
+            future.set_exception(ex)
+        return future
+
+def _make_pool(executor : str = "process") -> Executor:
+    """Creates the executor used to parallelize the import.
+
+    Parameters
+    ----------
+    executor : str, optional
+        One of "process" (:class:`ProcessPoolExecutor`), "thread" (:class:`ThreadPoolExecutor`) or None (serial), by default "process"
+    """
+    if executor == "process":
+        return _parallelize_pool()
+    elif executor == "thread":
+        return ThreadPoolExecutor()
+    elif executor is None:
+        return _SerialExecutor()
+    else:
+        raise ValueError(f"Unknown executor {executor}, expected 'process', 'thread' or None")
+
+def _map_selected(map_name : str, map_names : Union[Iterable[str], Callable[[str], bool]]) -> bool:
+    if map_names is None:
+        return True
+    elif callable(map_names):
+        return map_names(map_name)
+    else:
+        return map_name in map_names
 
 class CartoLLMap:
 
@@ -26,25 +63,48 @@ class CartoLLMap:
         XML element holding the map data
     path_prefix : str
         Prefix of the path to load from
+    point_cache_dir : str, optional
+        Directory used to cache the raw point data of the map. If a cache file of this map exists, it is loaded
+        instead of reading all point files, otherwise it is created after reading.
+        Only point it to caches created by this library, since the files are loaded with :mod:`pickle`.
+        By default None (no caching)
+    executor : str, optional
+        Executor used to read the points: "process", "thread" or None (serial). By default "process"
     """
 
-    def import_raw_points(self, path_prefix : str):
+    def import_raw_points(self, path_prefix : str, point_cache_dir : str = None, executor : str = "process"):
         """Imports all points and its detailed data of the current map
 
         Parameters
         ----------
         path_prefix : str
             Prefix of the path to load from
+        point_cache_dir : str, optional
+            Directory to cache the raw point data in, by default None (no caching)
+        executor : str, optional
+            Executor used to read the points: "process", "thread" or None (serial). By default "process"
         """
 
-        #read_f = lambda point_id: read_point_data(self.name, point_id, path_prefix)
-        with _parallelize_pool() as pool:
-            self.point_raw_data = list(pool.map(read_point_data, repeat(self.name), 
-                                                        self.points_main_data["Id"], repeat(path_prefix), 
-                                                        chunksize=5))
-        pass
+        cache_fname = None
+        if point_cache_dir is not None:
+            cache_fname = os.path.join(point_cache_dir, f"{self.name}_raw_points.pkl")
+            if os.path.isfile(cache_fname):
+                with open(cache_fname, "rb") as cache_f:
+                    self.point_raw_data = pickle.load(cache_f)
+                return
 
-    def __init__(self, xml_h : Element, path_prefix : str) -> None:
+        #read_f = lambda point_id: read_point_data(self.name, point_id, path_prefix)
+        with _make_pool(executor) as pool:
+            self.point_raw_data = list(pool.map(read_point_data, repeat(self.name),
+                                                        self.points_main_data["Id"], repeat(path_prefix),
+                                                        chunksize=5))
+
+        if cache_fname is not None:
+            os.makedirs(point_cache_dir, exist_ok=True)
+            with open(cache_fname, "wb") as cache_f:
+                pickle.dump(self.point_raw_data, cache_f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def __init__(self, xml_h : Element, path_prefix : str, point_cache_dir : str = None, executor : str = "process") -> None:
 
         for k, v in xml_h.items():
             setattr(self, camel_to_snake_case(k), v)
@@ -78,7 +138,7 @@ class CartoLLMap:
                 #self.mesh_metadata = {}
 
         if "Id" in self.points_main_data: 
-            self.import_raw_points(path_prefix)
+            self.import_raw_points(path_prefix, point_cache_dir, executor)
 
 class CartoAuxMesh:
     """Class that holds auxiliary meshes of the CARTO system, e.g. generated by `CartoSeg`_.
@@ -135,6 +195,13 @@ class CartoLLStudy:
     arg2 : str, optional
         The name of the study to load, contained inside the directory or zip file.
         Will default to either the zip name or bottom most directory name.
+    map_names : Union[Iterable[str], Callable[[str], bool]], optional
+        Only maps whose name is contained in this list (or for which this function returns True) will be imported.
+        By default None (all maps)
+    point_cache_dir : str, optional
+        Directory used to cache the raw point data of each map, see :class:`CartoLLMap`. By default None (no caching)
+    executor : str, optional
+        Executor used to parallelize the import: "process", "thread" or None (serial). By default "process"
     """
 
     aux_mesh_reg_mat : np.ndarray = None
@@ -151,7 +218,7 @@ class CartoLLStudy:
         """
         self.aux_meshes = []
         
-        with ProcessPoolExecutor() as pool:
+        with _make_pool(self.executor) as pool:
             for elem in xml_h:
                 if elem.tag == "RegistrationMatrix":
                     self.aux_mesh_reg_mat = np.fromstring(elem.text, sep=" ").reshape([4, 4]) #Affine matrix
@@ -173,10 +240,11 @@ class CartoLLStudy:
             Path prefix pointing to the directory to read from
         """
         self.maps = []
-        with _parallelize_pool() as pool:
+        with _make_pool(self.executor) as pool:
             for elem in maps:
                 if elem.tag == "Map":
-                    self.maps.append(pool.submit(CartoLLMap, elem, path_prefix)) #self.maps.append(CartoLLMap(elem, path_prefix))
+                    if _map_selected(elem.attrib.get("Name"), self.map_names):
+                        self.maps.append(pool.submit(CartoLLMap, elem, path_prefix, self.point_cache_dir, self.executor)) #self.maps.append(CartoLLMap(elem, path_prefix))
                 elif elem.tag == "TagsTable":
                     self.tags_table = xml_to_dataframe(elem)
                 elif elem.tag == "ColoringTable":
@@ -259,8 +327,14 @@ class CartoLLStudy:
         #study_root = study_xml.getroot()
         self.visitag_data = read_visitag_dir(os.path.join(dir_name, "VisiTagExport"))
 
-    def __init__(self, arg1 : str, arg2 : str = None) -> None:
+    def __init__(self, arg1 : str, arg2 : str = None, map_names : Union[Iterable[str], Callable[[str], bool]] = None,
+                 point_cache_dir : str = None, executor : str = "process") -> None:
         assert issubclass(type(arg1), str), "Given arguments not (yet) supported"
+        if isinstance(map_names, str):
+            map_names = [map_names]
+        self.map_names = map_names
+        self.point_cache_dir = point_cache_dir
+        self.executor = executor
         if os.path.isdir(arg1):
             self._from_dir(arg1, arg2)
         elif os.path.isfile(arg1) and arg1.endswith(".zip"): #Possible second argument: study name
